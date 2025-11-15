@@ -1,0 +1,148 @@
+# ==============================================
+# PARETO TODO AGENT – STREAMLIT WEB APP
+# Just run: streamlit run app.py
+# ==============================================
+
+import streamlit as st
+import requests
+from openai import OpenAI
+from datetime import datetime, timedelta
+import json
+
+# === CONFIG ===
+st.set_page_config(page_title="Pareto To Do Agent", page_icon="rocket", layout="centered")
+st.title("Pareto To Do Agent")
+st.markdown("**80% results with 20% effort** — powered by Grok AI")
+
+# Sidebar inputs
+with st.sidebar:
+    st.header("Setup (One-Time)")
+    XAI_API_KEY = st.text_input("xAI (Grok) API Key", type="password", help="Get from https://x.ai/api")
+    TASK_LIST_ID = st.text_input("Microsoft To Do List ID", help="Get from Graph Explorer: /me/todo/lists")
+    st.caption("Need help? [See guide](#)")
+
+# Main app
+if not XAI_API_KEY or not TASK_LIST_ID:
+    st.info("Enter your xAI API key and To Do List ID in the sidebar to begin.")
+    st.stop()
+
+# Goal input
+goal = st.text_input("Enter your goal or project", placeholder="e.g., Launch a fitness app")
+
+if st.button("Generate Pareto Tasks", type="primary"):
+    if not goal.strip():
+        st.error("Please enter a goal.")
+    else:
+        with st.spinner("Analyzing with Grok AI..."):
+            try:
+                client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
+                prompt = f"""
+                Goal: {goal}
+                Apply Pareto Principle: Identify the 20% of actions that deliver 80% of results.
+                Return exactly 3–5 tasks as:
+                1. Title - Short description with [ ] checklist if needed
+                Focus on leverage, speed, and impact.
+                """
+                response = client.chat.completions.create(
+                    model="grok-4",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=500
+                )
+                steps_text = response.choices[0].message.content.strip()
+            except Exception as e:
+                st.error(f"Grok AI error: {e}")
+                st.stop()
+
+        st.success("Pareto Tasks Generated!")
+        st.markdown("### Preview:")
+        st.code(steps_text, language=None)
+
+        # Parse tasks
+        tasks = []
+        for line in steps_text.split("\n"):
+            if line.strip() and line[0].isdigit():
+                parts = line.split("-", 1)
+                if len(parts) == 2:
+                    title = parts[0].strip()[2:].strip()  # Remove "1. "
+                    desc = parts[1].strip()
+                    tasks.append({"title": title, "desc": desc})
+
+        # Store in session
+        st.session_state.tasks = tasks
+        st.session_state.steps_text = steps_text
+
+# === CREATE IN MICROSOFT TO DO ===
+if "tasks" in st.session_state:
+    st.markdown("---")
+    if st.button("Create All Tasks in Microsoft To Do", type="primary"):
+        with st.spinner("Authenticating with Microsoft..."):
+            try:
+                # Device Code Flow (no Azure app needed)
+                auth_url = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
+                token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+                client_id = "d3590ed6-52b3-4102-aeff-aad2292ab01c"  # Public To Do app
+                scope = "Tasks.ReadWrite offline_access"
+
+                r = requests.post(auth_url, data={"client_id": client_id, "scope": scope})
+                resp = r.json()
+                st.info(f"Go to: [{resp['verification_uri']}]({resp['verification_uri']})  \nEnter code: `{resp['user_code']}`")
+                st.caption("Complete login in the new tab, then return here.")
+
+                if st.button("I have signed in – Get Token"):
+                    with st.spinner("Fetching token..."):
+                        while True:
+                            t = requests.post(token_url, data={
+                                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                                "client_id": client_id,
+                                "device_code": resp['device_code']
+                            })
+                            token = t.json()
+                            if "access_token" in token:
+                                access_token = token["access_token"]
+                                st.success("Authenticated with Microsoft!")
+                                break
+                            elif token.get("error") != "authorization_pending":
+                                st.error(f"Login failed: {token.get('error_description')}")
+                                st.stop()
+            except Exception as e:
+                st.error(f"Auth error: {e}")
+                st.stop()
+
+        # Create tasks
+        with st.spinner("Creating tasks in To Do..."):
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT10:00:00")
+            reminder = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT09:00:00")
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+
+            success_count = 0
+            for task in st.session_state.tasks:
+                payload = {
+                    "title": task["title"],
+                    "body": {"content": task["desc"], "contentType": "text"},
+                    "importance": "high",
+                    "dueDateTime": {"dateTime": tomorrow, "timeZone": "Eastern Standard Time"},
+                    "reminderDateTime": {"dateTime": reminder, "timeZone": "Eastern Standard Time"},
+                    "isReminderOn": True,
+                    "categories": ["Pareto-80/20"]
+                }
+                url = f"https://graph.microsoft.com/v1.0/me/todo/lists/{TASK_LIST_ID}/tasks"
+                r = requests.post(url, headers=headers, json=payload)
+                if r.status_code == 201:
+                    st.success(f"Created: **{task['title']}**")
+                    success_count += 1
+                else:
+                    st.error(f"Failed: {task['title']} → {r.text}")
+
+            if success_count == len(st.session_state.tasks):
+                st.balloons()
+                st.markdown(f"### Done! {success_count} tasks created in Microsoft To Do.")
+            else:
+                st.warning("Some tasks failed. Check above.")
+
+# Footer
+st.markdown("---")
+st.caption("Built with ❤️ using Grok AI + Microsoft Graph + Streamlit")
